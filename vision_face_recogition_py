@@ -1,0 +1,470 @@
+# vision_face_recognition.py
+import cv2
+import face_recognition
+import numpy as np
+import os
+import pickle
+import threading
+import time
+from collections import defaultdict
+import logging
+import platform
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class FaceRecognitionService:
+    def __init__(self, known_faces_dir="known_faces", model_path="face_model.pkl", 
+                 confidence_threshold=0.6, greeting_cooldown=10,
+                 camera_id=0, camera_width=640, camera_height=480):
+        """
+        Initialize face recognition service
+        
+        Args:
+            known_faces_dir: Directory containing subfolders with person names and their photos
+            model_path: Path to save/load the trained model
+            confidence_threshold: Minimum confidence for face matching (0-1)
+            greeting_cooldown: Seconds to wait before greeting the same person again
+            camera_id: Camera device ID (0 for default, 1 for external, etc.)
+            camera_width: Desired camera width
+            camera_height: Desired camera height
+        """
+        self.known_faces_dir = known_faces_dir
+        self.model_path = model_path
+        self.confidence_threshold = confidence_threshold
+        self.greeting_cooldown = greeting_cooldown
+        self.camera_id = camera_id
+        self.camera_width = camera_width
+        self.camera_height = camera_height
+        
+        self.known_face_encodings = []
+        self.known_face_names = []
+        self.last_greeting_time = defaultdict(float)
+        
+        # Thread safety for face recognition
+        self.lock = threading.Lock()
+        self.is_running = False
+        self.camera_thread = None
+        self.video_capture = None
+        
+        # Track current speaker and wake state
+        self.current_speaker = None
+        self.is_awake = False
+        self.wake_callback = None
+        self.last_known_face = None
+        
+        # Load or train the model
+        if os.path.exists(model_path):
+            self.load_model()
+        else:
+            logger.info("No existing model found. Training from your folders...")
+            self.train_model()
+            
+        # Callback for when a person is recognized
+        self.on_face_recognized = None
+        self.on_unknown_face = None
+        
+        logger.info(f"Face recognition service initialized with {len(self.known_face_names)} faces")
+
+    def train_model(self):
+        """Train the model using photos in the known_faces directory"""
+        logger.info("Training face recognition model from your folders...")
+        
+        if not os.path.exists(self.known_faces_dir):
+            logger.error(f"Directory {self.known_faces_dir} does not exist!")
+            return
+            
+        # Clear existing data
+        self.known_face_encodings = []
+        self.known_face_names = []
+        
+        # Structure: known_faces_dir/person_name/person_photos.jpg
+        person_folders = [f for f in os.listdir(self.known_faces_dir) 
+                         if os.path.isdir(os.path.join(self.known_faces_dir, f))]
+        
+        if not person_folders:
+            logger.warning(f"No person folders found in {self.known_faces_dir}")
+            return
+        
+        logger.info(f"Found {len(person_folders)} person folders")
+        
+        for person_name in person_folders:
+            person_dir = os.path.join(self.known_faces_dir, person_name)
+            
+            if not os.path.isdir(person_dir):
+                continue
+                
+            logger.info(f"Processing photos for: {person_name}")
+            face_count = 0
+            
+            # Load all photos for this person
+            image_files = [f for f in os.listdir(person_dir) 
+                          if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif'))]
+            
+            if not image_files:
+                logger.warning(f"No image files found for {person_name}")
+                continue
+            
+            for filename in image_files:
+                image_path = os.path.join(person_dir, filename)
+                
+                try:
+                    # Load image and get face encodings
+                    image = face_recognition.load_image_file(image_path)
+                    face_encodings = face_recognition.face_encodings(image)
+                    
+                    if face_encodings:
+                        self.known_face_encodings.append(face_encodings[0])
+                        self.known_face_names.append(person_name)
+                        face_count += 1
+                        logger.debug(f"  Added face from: {filename}")
+                    else:
+                        logger.warning(f"  No face found in: {filename}")
+                except Exception as e:
+                    logger.error(f"  Error processing {filename}: {e}")
+            
+            logger.info(f"  Added {face_count} faces for {person_name}")
+        
+        # Save the model
+        self.save_model()
+        logger.info(f"Model trained with {len(self.known_face_names)} faces from {len(person_folders)} people")
+
+    def save_model(self):
+        """Save the trained model to disk"""
+        model_data = {
+            'encodings': self.known_face_encodings,
+            'names': self.known_face_names
+        }
+        try:
+            with open(self.model_path, 'wb') as f:
+                pickle.dump(model_data, f)
+            logger.info(f"Model saved to {self.model_path}")
+        except Exception as e:
+            logger.error(f"Failed to save model: {e}")
+
+    def load_model(self):
+        """Load a trained model from disk"""
+        try:
+            with open(self.model_path, 'rb') as f:
+                model_data = pickle.load(f)
+            self.known_face_encodings = model_data['encodings']
+            self.known_face_names = model_data['names']
+            logger.info(f"Model loaded with {len(self.known_face_names)} faces")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            logger.info("Training new model from your folders...")
+            self.train_model()
+
+    def add_new_person(self, person_name, image_paths=None):
+        """
+        Add a new person to the system
+        
+        Args:
+            person_name: Name of the person
+            image_paths: List of image paths for this person (optional)
+        """
+        person_dir = os.path.join(self.known_faces_dir, person_name)
+        os.makedirs(person_dir, exist_ok=True)
+        
+        if image_paths:
+            import shutil
+            for i, img_path in enumerate(image_paths):
+                ext = os.path.splitext(img_path)[1]
+                new_path = os.path.join(person_dir, f"{person_name}_{i}{ext}")
+                shutil.copy2(img_path, new_path)
+                logger.info(f"Added image for {person_name}: {new_path}")
+        
+        # Retrain the model
+        with self.lock:
+            self.train_model()
+        logger.info(f"Added {person_name} to the system")
+
+    def set_wake_state(self, is_awake, speaker_name=None):
+        """
+        Set the wake state of the system
+        
+        Args:
+            is_awake: Whether the system is awake
+            speaker_name: Name of the person who woke the system (if known)
+        """
+        self.is_awake = is_awake
+        if is_awake and speaker_name:
+            self.current_speaker = speaker_name
+            logger.info(f"System awakened by: {speaker_name}")
+        elif not is_awake:
+            self.current_speaker = None
+            logger.info("System went to sleep")
+
+    def recognize_face(self, face_encoding):
+        """
+        Recognize a single face encoding
+        
+        Returns:
+            tuple: (name, confidence) or (None, 0) if unknown
+        """
+        if not self.known_face_encodings:
+            return None, 0.0
+            
+        # Compare with known faces
+        matches = face_recognition.compare_faces(
+            self.known_face_encodings, 
+            face_encoding,
+            tolerance=self.confidence_threshold
+        )
+        
+        if True in matches:
+            # Find best match
+            face_distances = face_recognition.face_distance(
+                self.known_face_encodings, 
+                face_encoding
+            )
+            best_match_index = np.argmin(face_distances)
+            
+            if matches[best_match_index]:
+                confidence = 1 - face_distances[best_match_index]
+                return self.known_face_names[best_match_index], confidence
+                
+        return None, 0.0
+
+    def process_frame(self, frame):
+        """
+        Process a single frame for face recognition
+        
+        Args:
+            frame: Image frame from webcam
+            
+        Returns:
+            tuple: (processed_frame, detected_faces)
+            detected_faces is a list of dicts with 'name', 'confidence', 'box'
+        """
+        # Resize frame for faster processing
+        small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+        rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+        
+        # Find all faces in the frame
+        face_locations = face_recognition.face_locations(rgb_small_frame)
+        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+        
+        detected_faces = []
+        
+        for face_encoding in face_encodings:
+            name, confidence = self.recognize_face(face_encoding)
+            
+            if name:
+                # Only trigger callback if system is awake AND it's the speaker
+                if self.is_awake and self.current_speaker:
+                    # Check if this is the person who woke the system
+                    if name == self.current_speaker:
+                        # Check cooldown
+                        current_time = time.time()
+                        if current_time - self.last_greeting_time[name] >= self.greeting_cooldown:
+                            self.last_greeting_time[name] = current_time
+                            logger.info(f"Recognized speaker: {name} (confidence: {confidence:.2f})")
+                            
+                            # Trigger callback if set
+                            if self.on_face_recognized:
+                                self.on_face_recognized(name, confidence)
+                                
+                            self.last_known_face = name
+                    else:
+                        logger.debug(f"Face detected but not the speaker: {name} (speaker is {self.current_speaker})")
+                else:
+                    # Just track the face even if not awake
+                    self.last_known_face = name
+                    logger.debug(f"Face detected but system not awake or no speaker identified")
+            else:
+                # Unknown face
+                if self.on_unknown_face and self.is_awake:
+                    self.on_unknown_face()
+            
+            detected_faces.append({
+                'name': name or "Unknown",
+                'confidence': confidence,
+                'box': None  # Will be filled after scaling
+            })
+        
+        # Scale back up and draw rectangles
+        for (top, right, bottom, left), face_info in zip(face_locations, detected_faces):
+            top *= 4
+            right *= 4
+            bottom *= 4
+            left *= 4
+            face_info['box'] = (top, right, bottom, left)
+            
+            # Draw rectangle with different colors based on state
+            if face_info['name'] != "Unknown":
+                # Green if it's the current speaker, cyan otherwise
+                if self.is_awake and self.current_speaker == face_info['name']:
+                    color = (0, 255, 0)  # Green - active speaker
+                else:
+                    color = (255, 255, 0)  # Cyan - detected but not active
+            else:
+                color = (0, 0, 255)  # Red - unknown
+            
+            cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
+            
+            # Draw label with state indicator
+            if self.is_awake and self.current_speaker == face_info['name']:
+                status = "ACTIVE"
+            elif face_info['name'] != "Unknown":
+                status = "DETECTED"
+            else:
+                status = "UNKNOWN"
+                
+            label = f"{face_info['name']} ({status})"
+            cv2.rectangle(frame, (left, bottom - 35), (right, bottom), color, cv2.FILLED)
+            font = cv2.FONT_HERSHEY_DUPLEX
+            cv2.putText(frame, label, (left + 6, bottom - 6), font, 0.8, (255, 255, 255), 1)
+        
+        return frame, detected_faces
+
+    def start_camera(self, camera_id=None):
+        """Start the camera in a separate thread for continuous monitoring"""
+        if self.is_running:
+            logger.warning("Camera already running")
+            return False
+            
+        # Use provided camera_id or fallback to stored one
+        cam_id = camera_id if camera_id is not None else self.camera_id
+        
+        # Handle IP cameras (RTSP/HTTP)
+        if isinstance(cam_id, str) and cam_id.startswith(('http', 'rtsp')):
+            logger.info(f"Connecting to IP camera: {cam_id}")
+            self.video_capture = cv2.VideoCapture(cam_id)
+        else:
+            # Try different camera backends for better compatibility
+            backends = [
+                cv2.CAP_ANY,  # Auto-detect
+            ]
+            
+            # Add platform-specific backends
+            if platform.system() == "Windows":
+                backends.extend([cv2.CAP_DSHOW, cv2.CAP_MSMF])
+            elif platform.system() == "Linux":
+                backends.extend([cv2.CAP_V4L2, cv2.CAP_V4L])
+            
+            self.video_capture = None
+            
+            # Try each backend
+            for backend in backends:
+                try:
+                    logger.info(f"Trying camera {cam_id} with backend {backend}")
+                    cap = cv2.VideoCapture(cam_id, backend)
+                    
+                    if cap.isOpened():
+                        self.video_capture = cap
+                        break
+                except Exception as e:
+                    logger.debug(f"Backend {backend} failed: {e}")
+            
+            if not self.video_capture or not self.video_capture.isOpened():
+                # Fallback: try without specifying backend
+                self.video_capture = cv2.VideoCapture(cam_id)
+        
+        if not self.video_capture.isOpened():
+            logger.error(f"Could not open camera {cam_id}")
+            self.is_running = False
+            return False
+            
+        # Set resolution if supported
+        if self.camera_width and self.camera_height:
+            self.video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.camera_width)
+            self.video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.camera_height)
+        
+        # Get actual resolution
+        actual_width = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self.video_capture.get(cv2.CAP_PROP_FPS)
+        
+        logger.info(f"Camera opened: {actual_width}x{actual_height} @ {fps:.1f}fps")
+        
+        self.is_running = True
+        self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
+        self.camera_thread.start()
+        logger.info(f"Camera started on device {cam_id}")
+        return True
+
+    def _camera_loop(self):
+        """Main camera loop running in separate thread"""
+        frame_skip = 0
+        while self.is_running and self.video_capture:
+            ret, frame = self.video_capture.read()
+            if not ret:
+                logger.error("Failed to capture frame")
+                break
+                
+            # Process every 2nd frame to improve performance
+            frame_skip += 1
+            if frame_skip % 2 == 0:
+                continue
+                
+            # Process frame
+            processed_frame, detected_faces = self.process_frame(frame)
+            
+            # Display frame (optional - can be disabled for headless operation)
+            if self.is_running:
+                cv2.imshow('Face Recognition', processed_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    self.stop_camera()
+                    break
+
+    def stop_camera(self):
+        """Stop the camera thread"""
+        self.is_running = False
+        if self.camera_thread:
+            self.camera_thread.join(timeout=2)
+        if self.video_capture:
+            self.video_capture.release()
+        cv2.destroyAllWindows()
+        logger.info("Camera stopped")
+
+    def capture_frame_for_training(self, person_name, num_images=5):
+        """
+        Capture multiple frames for training a new person
+        
+        Args:
+            person_name: Name of the person
+            num_images: Number of images to capture
+        """
+        if not self.video_capture or not self.video_capture.isOpened():
+            self.start_camera()
+            time.sleep(1)  # Wait for camera to warm up
+            
+        person_dir = os.path.join(self.known_faces_dir, person_name)
+        os.makedirs(person_dir, exist_ok=True)
+        
+        captured = 0
+        images_paths = []
+        
+        print(f"📸 Capturing {num_images} images for {person_name}")
+        print("Press 'c' to capture, 'q' to quit")
+        
+        while captured < num_images and self.video_capture:
+            ret, frame = self.video_capture.read()
+            if not ret:
+                break
+                
+            # Show preview
+            display_frame = frame.copy()
+            cv2.putText(display_frame, f"Press 'c' to capture ({captured}/{num_images})", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imshow('Capture for Training', display_frame)
+            
+            key = cv2.waitKey(1) & 0xFF
+            
+            if key == ord('c'):
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                img_path = os.path.join(person_dir, f"{person_name}_{timestamp}.jpg")
+                cv2.imwrite(img_path, frame)
+                images_paths.append(img_path)
+                captured += 1
+                print(f"✅ Captured image {captured}/{num_images}")
+            elif key == ord('q'):
+                break
+        
+        cv2.destroyWindow('Capture for Training')
+        
+        if images_paths:
+            self.add_new_person(person_name, images_paths)
+            
+        return images_paths
